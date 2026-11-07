@@ -1,0 +1,190 @@
+# سير عمل الفهرس — النشر الموثوق بهوية سير العمل (الفكرة 1)
+# خطة الخطوة الخامسة §4.3: مستودع الفهرس نفسه يتحقق ويكتب —
+# الناشر لا يكتب الفهرس مباشرة أبدا. عند كل طلب دمج نحو main
+# يفحص السير العمل السطر المضاف الواحد (نشرا كان أو سحبا)،
+# وعند نجاح كل الفحوصات يدمج الطلب.
+# مسودة محلية — تُرفع إلى RIO4140/niva-index عند تفعيل النشر.
+# (ملف بنية تحتية: أسماء الخطوات والتعليقات والرسائل عربية؛
+# وأسماء الأوامر والمتغيرات والحقول لاتينية كما في واجهة جيت هاب.)
+name: تحقق من الفهرس
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['فهرس.حزمة']
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  تحقق:
+    runs-on: ubuntu-latest
+    steps:
+      - name: جلب الطلب كاملا
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: جلب الأساس
+        run: git fetch origin main
+
+      - name: الفرق ملف واحد وسطر مضاف واحد
+        run: |
+          set -euo pipefail
+          files="$(git diff --name-only origin/main...HEAD)"
+          if [ "$files" != "فهرس.حزمة" ]; then
+            echo "طلب الدمج يغيّر ملفات غير فهرس.حزمة: $files"
+            exit 1
+          fi
+          added="$(git diff --unified=0 origin/main...HEAD -- فهرس.حزمة | grep -c '^+' || true)"
+          removed="$(git diff --unified=0 origin/main...HEAD -- فهرس.حزمة | grep -c '^-' || true)"
+          # سطرا الترويسة +++ و--- لا يُعدّان
+          added=$((added - 1))
+          removed=$((removed - 1))
+          if [ "$added" != "1" ] || [ "$removed" != "0" ]; then
+            echo "طلب الدمج يضيف $added سطرا ويحذف $removed — والمسموح سطر مضاف واحد فقط"
+            exit 1
+          fi
+          git diff --unified=0 origin/main...HEAD -- فهرس.حزمة | grep '^+' | tail -n +2 | sed 's/^+//' > added_line.txt
+          echo "السطر المضاف:"
+          cat added_line.txt
+
+      - name: تحقق من السطر والبصمات والهوية
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import json, os, re, subprocess, sys, urllib.request, urllib.error, hashlib
+
+          author = os.environ['PR_AUTHOR']
+          token = os.environ['GH_TOKEN']
+
+          def fail(msg):
+              print('رفض: ' + msg)
+              sys.exit(1)
+
+          def git(args):
+              return subprocess.run(args, check=True, capture_output=True, text=True).stdout
+
+          def github_get(url):
+              req = urllib.request.Request(url)
+              req.add_header('Accept', 'application/vnd.github+json')
+              req.add_header('Authorization', 'Bearer ' + token)
+              req.add_header('User-Agent', 'niva-index-workflow')
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      return resp.status, resp.read()
+              except urllib.error.HTTPError as err:
+                  return err.code, err.read()
+
+          line = open('added_line.txt', encoding='utf-8').read().strip()
+          if not line:
+              fail('السطر المضاف فارغ')
+          fields = line.split(' ')
+
+          base = git(['git', 'show', 'origin/main:فهرس.حزمة'])
+          base_entries = []
+          base_yanks = []
+          for raw in base.splitlines():
+              s = raw.strip()
+              if not s or s.startswith('#'):
+                  continue
+              parts = s.split(' ')
+              if parts[0] == 'سحب':
+                  base_yanks.append((parts[1], parts[2]))
+              else:
+                  base_entries.append((parts[0], parts[1]))
+
+          if fields[0] == 'سحب':
+              # --- سطر سحب: تحقق الوجود وعدم التكرار والصلاحية ---
+              if len(fields) < 3:
+                  fail('سطر سحب غير صالح: ' + line)
+              name, version = fields[1], fields[2]
+              if (name, version) not in base_entries:
+                  fail('لا يوجد إصدار ' + version + ' للحزمة ' + name + ' في الفهرس')
+              if (name, version) in base_yanks:
+                  fail('الإصدار ' + version + ' للحزمة ' + name + ' مسحوب أصلا')
+              original_publisher = None
+              for raw in base.splitlines():
+                  parts = raw.strip().split(' ')
+                  if len(parts) >= 8 and parts[0] == name and parts[1] == version:
+                      original_publisher = parts[5]
+                      break
+              if author != original_publisher and author != 'RIO4140':
+                  fail('طالب السحب ' + author + ' ليس ناشر الحزمة ' + (original_publisher or '') + ' ولا مالك الفهرس')
+              print('سحب صالح: ' + name + ' ' + version)
+              sys.exit(0)
+
+          # --- سطر نشر: 8 حقول ثم الوصف ---
+          if len(fields) < 8:
+              fail('سطر فهرس غير صالح (أقل من 8 حقول): ' + line)
+          name, version, repo, tag, commit_fp, publisher, stamp, manifest_fp = fields[:8]
+          if '-' in name:
+              fail('اسم الحزمة فيه شرطة -: ' + name)
+          if not re.fullmatch(r'\d+\.\d+\.\d+(-[A-Za-z0-9_.\u0600-\u06FF-]+)?', version):
+              fail('إصدار غير صالح: ' + version)
+          m = re.fullmatch(r'github\.com/([^/\s]+)/([^/\s]+)', repo)
+          if not m:
+              fail('مستودع غير صالح: ' + repo)
+          src_owner, src_repo = m.group(1), m.group(2)
+          if not tag or ' ' in tag:
+              fail('وسم غير صالح: ' + tag)
+          if not re.fullmatch(r'[0-9a-f]{40}', commit_fp):
+              fail('بصمة التزام غير صالحة: ' + commit_fp)
+          if not re.fullmatch(r'[0-9a-f]{64}', manifest_fp):
+              fail('بصمة بيان غير صالحة: ' + manifest_fp)
+          if not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z', stamp):
+              fail('طابع زمني غير صالح: ' + stamp)
+          if (name, version) in base_entries:
+              fail('الإصدار ' + version + ' للحزمة ' + name + ' منشور أصلا')
+          if publisher != author:
+              fail('ناشر السطر ' + publisher + ' ليس صاحب طلب الدمج ' + author)
+          if src_owner != author:
+              status, _ = github_get(
+                  'https://api.github.com/repos/' + src_owner + '/' + src_repo
+                  + '/collaborators/' + author)
+              if status != 204:
+                  fail('مستودع المصدر ' + repo + ' ليس ملكا لصاحب الطلب ولا هو متعاون فيه')
+          # بصمة البيان من مستودع المصدر عند الوسم
+          manifest_url = ('https://raw.githubusercontent.com/' + src_owner + '/'
+                          + src_repo + '/' + tag + '/بيان.حزمة')
+          try:
+              with urllib.request.urlopen(manifest_url, timeout=30) as resp:
+                  manifest_bytes = resp.read()
+          except Exception as err:
+              fail('تعذّر قراءة بيان.حزمة عند الوسم ' + tag + ': ' + str(err))
+          if hashlib.sha256(manifest_bytes).hexdigest() != manifest_fp:
+              fail('بصمة البيان لا تطابق بيان.حزمة عند الوسم ' + tag)
+          manifest_text = manifest_bytes.decode('utf-8')
+          manifest_name = None
+          manifest_version = None
+          for raw in manifest_text.splitlines():
+              if raw.startswith('اسم:'):
+                  manifest_name = raw.split(':', 1)[1].strip()
+              if raw.startswith('إصدار:'):
+                  manifest_version = raw.split(':', 1)[1].strip()
+          if manifest_name != name or manifest_version != version:
+              fail('بيان.حزمة عند الوسم لحزمة ' + str(manifest_name) + ' ' + str(manifest_version)
+                   + ' لا يطابق السطر ' + name + ' ' + version)
+          # بصمة الالتزام عند الوسم نفسه
+          status, body = github_get('https://api.github.com/repos/' + src_owner + '/'
+                                    + src_repo + '/commits/' + tag)
+          if status != 200:
+              fail('تعذّر قراءة التزام الوسم ' + tag + ' (الحالة ' + str(status) + ')')
+          tag_commit = json.loads(body.decode('utf-8'))['sha']
+          if tag_commit != commit_fp:
+              fail('بصمة الالتزام لا تطابق التزام الوسم ' + tag)
+          print('نشر صالح: ' + name + ' ' + version + ' من ' + repo + ' عند ' + tag)
+          PYEOF
+
+      - name: دمج الطلب
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh pr merge "${{ github.event.pull_request.number }}" --merge --delete-branch
+          echo "دُمج طلب النشر — سُجّل بهوية الناشر ومستودعه ووسمه وبصمته"
